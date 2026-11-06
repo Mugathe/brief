@@ -1,0 +1,18 @@
+# Keeps the news archive growing even when nobody visits the site.
+# Add two secrets in GitHub (Settings -> Secrets and variables -> Actions):
+#   SITE_URL    e.g. https://your-site.example     (no trailing slash)
+#   INGEST_KEY  the same INGEST_KEY you set on the server
+name: Save headlines
+on:
+  schedule:
+    - cron: "*/20 * * * *"
+  workflow_dispatch:
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ask the site to fetch and save the news
+        run: |
+          curl --fail --silent --show-error --max-time 120 \
+            -H "Authorization: Bearer ${{ secrets.INGEST_KEY }}" \
+            "${{ secrets.SITE_URL }}/api/public/ingest"

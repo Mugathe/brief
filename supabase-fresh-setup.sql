@@ -1,0 +1,1224 @@
+create type public.app_role as enum ('admin','editor','moderator');
+
+create table public.user_roles (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null,
+  role public.app_role not null,
+  created_at timestamptz not null default now(),
+  unique (user_id, role)
+);
+grant select on public.user_roles to authenticated;
+grant all on public.user_roles to service_role;
+alter table public.user_roles enable row level security;
+
+create or replace function public.has_role(_user_id uuid, _role public.app_role)
+returns boolean language sql stable security definer set search_path = public
+as $$ select exists (select 1 from public.user_roles where user_id = _user_id and role = _role) $$;
+
+create or replace function public.is_staff(_user_id uuid)
+returns boolean language sql stable security definer set search_path = public
+as $$ select exists (select 1 from public.user_roles where user_id = _user_id) $$;
+
+create policy "Users see own roles, admins see all" on public.user_roles for select to authenticated
+using (user_id = auth.uid() or public.has_role(auth.uid(),'admin'));
+
+-- First account to sign up becomes admin
+create or replace function public.bootstrap_first_admin()
+returns trigger language plpgsql security definer set search_path = public
+as $$
+begin
+  if not exists (select 1 from public.user_roles where role = 'admin') then
+    insert into public.user_roles(user_id, role) values (new.id, 'admin');
+  end if;
+  return new;
+end $$;
+create trigger on_auth_user_created_bootstrap after insert on auth.users
+for each row execute function public.bootstrap_first_admin();
+
+-- Analytics
+create table public.page_views (
+  id bigint generated always as identity primary key,
+  visitor_id text not null,
+  session_id text not null,
+  path text not null,
+  referrer text,
+  country text,
+  device text,
+  created_at timestamptz not null default now()
+);
+create index on public.page_views (created_at desc);
+create index on public.page_views (visitor_id);
+grant select on public.page_views to authenticated;
+grant all on public.page_views to service_role;
+alter table public.page_views enable row level security;
+create policy "Staff read views" on public.page_views for select to authenticated using (public.is_staff(auth.uid()));
+
+create table public.site_events (
+  id bigint generated always as identity primary key,
+  visitor_id text not null,
+  type text not null,
+  target text,
+  path text,
+  created_at timestamptz not null default now()
+);
+create index on public.site_events (created_at desc);
+create index on public.site_events (type);
+grant select on public.site_events to authenticated;
+grant all on public.site_events to service_role;
+alter table public.site_events enable row level security;
+create policy "Staff read events" on public.site_events for select to authenticated using (public.is_staff(auth.uid()));
+
+-- Ads
+create table public.ads (
+  id uuid primary key default gen_random_uuid(),
+  title text not null,
+  kind text not null default 'banner',
+  image_url text,
+  link_url text,
+  adsense_slot text,
+  placement text not null default 'home_top',
+  active boolean not null default true,
+  starts_at timestamptz,
+  ends_at timestamptz,
+  priority int not null default 0,
+  created_at timestamptz not null default now()
+);
+grant select on public.ads to anon, authenticated;
+grant insert, update, delete on public.ads to authenticated;
+grant all on public.ads to service_role;
+alter table public.ads enable row level security;
+create policy "Public sees active ads" on public.ads for select to anon, authenticated
+using (active and (starts_at is null or starts_at <= now()) and (ends_at is null or ends_at > now()));
+create policy "Staff see all ads" on public.ads for select to authenticated using (public.is_staff(auth.uid()));
+create policy "Admins/editors manage ads" on public.ads for all to authenticated
+using (public.has_role(auth.uid(),'admin') or public.has_role(auth.uid(),'editor'))
+with check (public.has_role(auth.uid(),'admin') or public.has_role(auth.uid(),'editor'));
+
+-- Site settings (theme, adsense id, content filters)
+create table public.site_settings (
+  key text primary key,
+  value jsonb not null,
+  updated_at timestamptz not null default now()
+);
+grant select on public.site_settings to anon, authenticated;
+grant insert, update, delete on public.site_settings to authenticated;
+grant all on public.site_settings to service_role;
+alter table public.site_settings enable row level security;
+create policy "Public read settings" on public.site_settings for select to anon, authenticated using (true);
+create policy "Admins/editors write settings" on public.site_settings for all to authenticated
+using (public.has_role(auth.uid(),'admin') or public.has_role(auth.uid(),'editor'))
+with check (public.has_role(auth.uid(),'admin') or public.has_role(auth.uid(),'editor'));
+insert into public.site_settings(key,value) values
+ ('theme','{"name":"default"}'),
+ ('adsense','{"client":""}'),
+ ('content','{"hiddenLinks":[],"blockedSources":[],"blockedWords":[],"pinnedLinks":[]}');
+
+-- Moderated manifesto entries for every office
+create table public.aspirant_entries (
+  id uuid primary key default gen_random_uuid(),
+  slug text not null unique,
+  name text not null,
+  office text not null default 'Governor',
+  region text,
+  affiliation text,
+  status text not null default 'Prospective',
+  overview text not null default '',
+  priorities text[] not null default '{}',
+  gaps text[] not null default '{}',
+  sources jsonb not null default '[]',
+  published boolean not null default false,
+  updated_at timestamptz not null default now(),
+  created_at timestamptz not null default now()
+);
+grant select on public.aspirant_entries to anon, authenticated;
+grant insert, update, delete on public.aspirant_entries to authenticated;
+grant all on public.aspirant_entries to service_role;
+alter table public.aspirant_entries enable row level security;
+create policy "Public read published" on public.aspirant_entries for select to anon, authenticated using (published);
+create policy "Staff read all" on public.aspirant_entries for select to authenticated using (public.is_staff(auth.uid()));
+create policy "Staff manage entries" on public.aspirant_entries for all to authenticated
+using (public.is_staff(auth.uid())) with check (public.is_staff(auth.uid()));
+
+-- Security / audit log
+create table public.security_events (
+  id bigint generated always as identity primary key,
+  severity text not null default 'info',
+  type text not null,
+  detail text,
+  actor uuid,
+  created_at timestamptz not null default now()
+);
+create index on public.security_events (created_at desc);
+grant select on public.security_events to authenticated;
+grant all on public.security_events to service_role;
+alter table public.security_events enable row level security;
+create policy "Admins read security" on public.security_events for select to authenticated using (public.has_role(auth.uid(),'admin'));
+
+-- 0001: richer ads, full manifesto entries for every office, safer publishing rights, ad image storage
+
+-- Ads: sponsor name + accessibility text
+alter table public.ads
+  add column if not exists sponsor text,
+  add column if not exists alt_text text;
+
+-- Manifesto entries: everything the public profile page shows
+alter table public.aspirant_entries
+  add column if not exists status_note text not null default '',
+  add column if not exists evidence_state text not null default 'Not yet assessed',
+  add column if not exists pillars jsonb not null default '[]',
+  add column if not exists reviewed_at date;
+create index if not exists aspirant_entries_office_idx on public.aspirant_entries (office);
+
+-- Only admins and editors may publish or edit published profiles.
+-- Moderators may create and edit drafts, so nothing reaches readers without an editor's sign-off.
+drop policy if exists "Staff manage entries" on public.aspirant_entries;
+drop policy if exists "Admins/editors manage entries" on public.aspirant_entries;
+create policy "Admins/editors manage entries" on public.aspirant_entries for all to authenticated
+using (public.has_role(auth.uid(),'admin') or public.has_role(auth.uid(),'editor'))
+with check (public.has_role(auth.uid(),'admin') or public.has_role(auth.uid(),'editor'));
+drop policy if exists "Moderators create drafts" on public.aspirant_entries;
+create policy "Moderators create drafts" on public.aspirant_entries for insert to authenticated
+with check (public.has_role(auth.uid(),'moderator') and not published);
+drop policy if exists "Moderators edit drafts" on public.aspirant_entries;
+create policy "Moderators edit drafts" on public.aspirant_entries for update to authenticated
+using (public.has_role(auth.uid(),'moderator') and not published)
+with check (public.has_role(auth.uid(),'moderator') and not published);
+
+-- Moderators may manage the content rules (hide stories, block sources/words) and nothing else in settings
+drop policy if exists "Moderators write content rules" on public.site_settings;
+create policy "Moderators write content rules" on public.site_settings for all to authenticated
+using (key = 'content' and public.has_role(auth.uid(),'moderator'))
+with check (key = 'content' and public.has_role(auth.uid(),'moderator'));
+
+-- Public site banner (announcements / celebrations / alerts)
+insert into public.site_settings(key,value) values
+ ('banner','{"active":false,"text":"","level":"info","link":""}')
+on conflict (key) do nothing;
+
+-- Keep updated_at honest
+create or replace function public.touch_updated_at()
+returns trigger language plpgsql as $$ begin new.updated_at = now(); return new; end $$;
+drop trigger if exists aspirant_entries_touch on public.aspirant_entries;
+create trigger aspirant_entries_touch before update on public.aspirant_entries
+for each row execute function public.touch_updated_at();
+drop trigger if exists site_settings_touch on public.site_settings;
+create trigger site_settings_touch before update on public.site_settings
+for each row execute function public.touch_updated_at();
+
+-- Storage for ad images
+insert into storage.buckets (id, name, public) values ('ad-images', 'ad-images', true)
+on conflict (id) do nothing;
+drop policy if exists "Public reads ad images" on storage.objects;
+create policy "Public reads ad images" on storage.objects for select to anon, authenticated
+using (bucket_id = 'ad-images');
+drop policy if exists "Admins/editors upload ad images" on storage.objects;
+create policy "Admins/editors upload ad images" on storage.objects for insert to authenticated
+with check (bucket_id = 'ad-images' and (public.has_role(auth.uid(),'admin') or public.has_role(auth.uid(),'editor')));
+drop policy if exists "Admins/editors update ad images" on storage.objects;
+create policy "Admins/editors update ad images" on storage.objects for update to authenticated
+using (bucket_id = 'ad-images' and (public.has_role(auth.uid(),'admin') or public.has_role(auth.uid(),'editor')));
+drop policy if exists "Admins/editors delete ad images" on storage.objects;
+create policy "Admins/editors delete ad images" on storage.objects for delete to authenticated
+using (bucket_id = 'ad-images' and (public.has_role(auth.uid(),'admin') or public.has_role(auth.uid(),'editor')));
+
+
+-- 0002: tracking that works without the service-role key, audit log from staff sessions,
+-- team management without the service-role key, and self-service manifesto submissions.
+
+-- ---------- Anonymous tracking (visitors can only INSERT, never read) ----------
+grant insert on public.page_views to anon, authenticated;
+drop policy if exists "Anyone records views" on public.page_views;
+create policy "Anyone records views" on public.page_views for insert to anon, authenticated
+with check (
+  char_length(path) between 1 and 300
+  and char_length(visitor_id) between 8 and 64
+  and char_length(session_id) between 8 and 64
+  and (referrer is null or char_length(referrer) <= 300)
+);
+
+grant insert on public.site_events to anon, authenticated;
+drop policy if exists "Anyone records events" on public.site_events;
+create policy "Anyone records events" on public.site_events for insert to anon, authenticated
+with check (
+  type in ('whatsapp_share','quote_card','story_click','audio_play','ad_view','ad_click')
+  and char_length(visitor_id) between 8 and 64
+  and (target is null or char_length(target) <= 300)
+  and (path is null or char_length(path) <= 300)
+);
+
+-- ---------- Security / audit log ----------
+grant insert on public.security_events to anon, authenticated;
+drop policy if exists "Anyone reports failed sign-in" on public.security_events;
+create policy "Anyone reports failed sign-in" on public.security_events for insert to anon, authenticated
+with check (type = 'failed_login' and severity = 'warning' and actor is null and (detail is null or char_length(detail) <= 250));
+drop policy if exists "Staff write own audit events" on public.security_events;
+create policy "Staff write own audit events" on public.security_events for insert to authenticated
+with check (public.is_staff(auth.uid()) and actor = auth.uid() and severity in ('info','notice'));
+
+-- ---------- Team management without the service-role key ----------
+create or replace function public.list_team()
+returns table(user_id uuid, email text, role public.app_role)
+language sql stable security definer set search_path = public, auth as $$
+  select r.user_id, u.email::text, r.role
+  from public.user_roles r join auth.users u on u.id = r.user_id
+  where public.has_role(auth.uid(), 'admin')
+  order by u.email, r.role
+$$;
+revoke all on function public.list_team() from public, anon;
+grant execute on function public.list_team() to authenticated;
+
+create or replace function public.grant_role_by_email(_email text, _role public.app_role)
+returns boolean language plpgsql security definer set search_path = public, auth as $$
+declare uid uuid;
+begin
+  if not public.has_role(auth.uid(), 'admin') then raise exception 'Admins only'; end if;
+  select id into uid from auth.users where lower(email) = lower(trim(_email)) limit 1;
+  if uid is null then return false; end if;
+  insert into public.user_roles(user_id, role) values (uid, _role) on conflict (user_id, role) do nothing;
+  insert into public.security_events(severity, type, detail, actor)
+    values ('notice', 'role_granted', trim(_email) || ' given ' || _role::text, auth.uid());
+  return true;
+end $$;
+revoke all on function public.grant_role_by_email(text, public.app_role) from public, anon;
+grant execute on function public.grant_role_by_email(text, public.app_role) to authenticated;
+
+create or replace function public.revoke_role(_user uuid, _role public.app_role)
+returns boolean language plpgsql security definer set search_path = public, auth as $$
+begin
+  if not public.has_role(auth.uid(), 'admin') then raise exception 'Admins only'; end if;
+  if _user = auth.uid() and _role = 'admin' then return false; end if;
+  delete from public.user_roles where user_id = _user and role = _role;
+  insert into public.security_events(severity, type, detail, actor)
+    values ('notice', 'role_revoked', _role::text || ' removed from ' || _user::text, auth.uid());
+  return true;
+end $$;
+revoke all on function public.revoke_role(uuid, public.app_role) from public, anon;
+grant execute on function public.revoke_role(uuid, public.app_role) to authenticated;
+
+-- ---------- Profiles: candidate-supplied statement + where a profile came from ----------
+alter table public.aspirant_entries
+  add column if not exists candidate_statement jsonb not null default '{}',
+  add column if not exists origin text not null default 'editorial';
+
+-- ---------- Self-service submissions from aspirants and their teams ----------
+create table if not exists public.aspirant_submissions (
+  id uuid primary key default gen_random_uuid(),
+  status text not null default 'pending' check (status in ('pending','needs_info','approved','rejected')),
+  name text not null check (char_length(name) between 2 and 120),
+  office text not null check (char_length(office) between 2 and 60),
+  region text check (region is null or char_length(region) <= 80),
+  affiliation text check (affiliation is null or char_length(affiliation) <= 120),
+  contact_name text not null check (char_length(contact_name) between 2 and 120),
+  contact_role text check (contact_role is null or char_length(contact_role) <= 80),
+  contact_email text not null check (char_length(contact_email) between 5 and 200 and contact_email like '%@%'),
+  contact_phone text check (contact_phone is null or char_length(contact_phone) <= 40),
+  overview text not null check (char_length(overview) between 20 and 3000),
+  priorities text[] not null default '{}',
+  pledges text not null default '' check (char_length(pledges) <= 8000),
+  costing text not null default '' check (char_length(costing) <= 4000),
+  delivery text not null default '' check (char_length(delivery) <= 4000),
+  track_record text not null default '' check (char_length(track_record) <= 4000),
+  sources jsonb not null default '[]',
+  review_notes text check (review_notes is null or char_length(review_notes) <= 1000),
+  reviewed_by uuid,
+  reviewed_at timestamptz,
+  entry_id uuid references public.aspirant_entries(id) on delete set null,
+  created_at timestamptz not null default now()
+);
+create index if not exists aspirant_submissions_status_idx on public.aspirant_submissions (status, created_at desc);
+grant insert on public.aspirant_submissions to anon, authenticated;
+grant select, update, delete on public.aspirant_submissions to authenticated;
+grant all on public.aspirant_submissions to service_role;
+alter table public.aspirant_submissions enable row level security;
+
+drop policy if exists "Anyone submits a profile" on public.aspirant_submissions;
+create policy "Anyone submits a profile" on public.aspirant_submissions for insert to anon, authenticated
+with check (status = 'pending' and review_notes is null and reviewed_by is null and entry_id is null);
+drop policy if exists "Staff read submissions" on public.aspirant_submissions;
+create policy "Staff read submissions" on public.aspirant_submissions for select to authenticated using (public.is_staff(auth.uid()));
+drop policy if exists "Staff review submissions" on public.aspirant_submissions;
+create policy "Staff review submissions" on public.aspirant_submissions for update to authenticated
+using (public.is_staff(auth.uid())) with check (public.is_staff(auth.uid()));
+drop policy if exists "Admins/editors delete submissions" on public.aspirant_submissions;
+create policy "Admins/editors delete submissions" on public.aspirant_submissions for delete to authenticated
+using (public.has_role(auth.uid(),'admin') or public.has_role(auth.uid(),'editor'));
+
+
+-- 0003: story archive (history), trending analysis, and followable news trails.
+
+-- ---------- Archive of every headline we have seen ----------
+create table if not exists public.news_archive (
+  id bigint generated always as identity primary key,
+  link text not null unique check (char_length(link) <= 1000),
+  title text not null check (char_length(title) between 3 and 400),
+  summary text not null default '' check (char_length(summary) <= 600),
+  source text not null default '',
+  platform text not null default '',
+  category text not null default 'General',
+  published_at timestamptz not null,
+  first_seen_at timestamptz not null default now(),
+  tsv_en tsvector generated always as (to_tsvector('english'::regconfig, coalesce(title,'') || ' ' || coalesce(summary,''))) stored,
+  tsv_title tsvector generated always as (to_tsvector('simple'::regconfig, coalesce(title,''))) stored
+);
+create index if not exists news_archive_published_idx on public.news_archive (published_at desc);
+create index if not exists news_archive_tsv_en_idx on public.news_archive using gin (tsv_en);
+create index if not exists news_archive_tsv_title_idx on public.news_archive using gin (tsv_title);
+grant select on public.news_archive to anon, authenticated;
+grant all on public.news_archive to service_role;
+alter table public.news_archive enable row level security;
+drop policy if exists "Public reads archive" on public.news_archive;
+create policy "Public reads archive" on public.news_archive for select to anon, authenticated using (true);
+-- No insert/update/delete policies: only the server (service role) writes history.
+
+-- ---------- Words ignored when finding trends ----------
+create table if not exists public.trend_stopwords (
+  word text primary key check (word = lower(word) and char_length(word) between 2 and 40)
+);
+grant select on public.trend_stopwords to anon, authenticated;
+grant insert, delete on public.trend_stopwords to authenticated;
+grant all on public.trend_stopwords to service_role;
+alter table public.trend_stopwords enable row level security;
+drop policy if exists "Public reads stopwords" on public.trend_stopwords;
+create policy "Public reads stopwords" on public.trend_stopwords for select to anon, authenticated using (true);
+drop policy if exists "Staff manage stopwords" on public.trend_stopwords;
+create policy "Staff manage stopwords" on public.trend_stopwords for all to authenticated
+using (public.has_role(auth.uid(),'admin') or public.has_role(auth.uid(),'editor') or public.has_role(auth.uid(),'moderator'))
+with check (public.has_role(auth.uid(),'admin') or public.has_role(auth.uid(),'editor') or public.has_role(auth.uid(),'moderator'));
+
+insert into public.trend_stopwords(word)
+select unnest(string_to_array(
+ 'the and for are but not you all any can had her was one our out has have his how its may new now old see two way who did get let put say she too use that this with from they will would there their what about which when your said says after over into than then them these those been being were more most some such only also just very much many other could should where while until under again off because before between both each even ever here how like make made need next first last back down still take told tell year years day days week weeks month months time today yesterday tomorrow people person man men woman women say says said saying news live latest update updates breaking watch video photos photo read full story stories report reports reportedly according amid says calls call urges wants want plans plan set sets gets goes going gone come comes came look looks looked show shows showed see seen found find finds why what who whom whose kenya kenyan kenyans nairobi county counties government govt national nation africa african east city town via per vs',
+ ' ')) on conflict do nothing;
+
+-- ---------- Trending analysis ----------
+-- Words that appear in more headlines now than before, with how many outlets carry them.
+create or replace function public.trending_terms(_days int, _limit int default 150)
+returns table(term text, stories int, sources int, prev_stories int)
+language sql stable set search_path = public as $$
+  with cur as (
+    select a.id, a.source, a.tsv_title from public.news_archive a
+    where a.published_at >= now() - make_interval(days => _days) and a.published_at <= now()
+  ), prev as (
+    select a.id, a.tsv_title from public.news_archive a
+    where a.published_at >= now() - make_interval(days => _days * 2) and a.published_at < now() - make_interval(days => _days)
+  ), c as (
+    select u.lexeme::text as term, count(distinct cur.id)::int as stories, count(distinct cur.source)::int as sources
+    from cur, unnest(cur.tsv_title) as u(lexeme, positions, weights)
+    where char_length(u.lexeme) >= 3 and u.lexeme !~ '[0-9]'
+      and not exists (select 1 from public.trend_stopwords s where s.word = u.lexeme)
+    group by u.lexeme
+    having count(distinct cur.id) >= 2
+  ), p as (
+    select u.lexeme::text as term, count(distinct prev.id)::int as stories
+    from prev, unnest(prev.tsv_title) as u(lexeme, positions, weights)
+    group by u.lexeme
+  )
+  select c.term, c.stories, c.sources, coalesce(p.stories, 0)::int
+  from c left join p on p.term = c.term
+  order by c.stories desc, c.sources desc, c.term
+  limit _limit
+$$;
+
+-- Daily/weekly/monthly counts for a few words, for sparklines.
+create or replace function public.term_series(_terms text[], _days int)
+returns table(term text, bucket date, stories int)
+language sql stable set search_path = public as $$
+  select u.lexeme::text,
+    (case when _days <= 31 then date_trunc('day', a.published_at)
+          when _days <= 120 then date_trunc('week', a.published_at)
+          else date_trunc('month', a.published_at) end)::date,
+    count(distinct a.id)::int
+  from public.news_archive a, unnest(a.tsv_title) as u(lexeme, positions, weights)
+  where a.published_at >= now() - make_interval(days => _days) and a.published_at <= now() and u.lexeme = any(_terms)
+  group by 1, 2
+  order by 1, 2
+$$;
+
+-- ---------- Trails: a topic followed through time ----------
+create table if not exists public.trails (
+  id uuid primary key default gen_random_uuid(),
+  slug text not null unique check (slug ~ '^[a-z0-9]+(-[a-z0-9]+)*$' and char_length(slug) between 3 and 60 and slug <> 'search'),
+  title text not null check (char_length(title) between 3 and 120),
+  description text not null default '' check (char_length(description) <= 1500),
+  query text not null check (char_length(query) between 2 and 200),
+  since date,
+  published boolean not null default false,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create table if not exists public.trail_events (
+  id uuid primary key default gen_random_uuid(),
+  trail_id uuid not null references public.trails(id) on delete cascade,
+  event_date date not null,
+  title text not null check (char_length(title) between 3 and 200),
+  summary text not null default '' check (char_length(summary) <= 800),
+  url text check (url is null or url ~* '^https?://'),
+  publisher text not null default '' check (char_length(publisher) <= 120),
+  created_at timestamptz not null default now()
+);
+create index if not exists trail_events_trail_idx on public.trail_events (trail_id, event_date);
+grant select on public.trails, public.trail_events to anon, authenticated;
+grant insert, update, delete on public.trails, public.trail_events to authenticated;
+grant all on public.trails, public.trail_events to service_role;
+alter table public.trails enable row level security;
+alter table public.trail_events enable row level security;
+
+drop policy if exists "Read published trails" on public.trails;
+create policy "Read published trails" on public.trails for select to anon, authenticated using (published or public.is_staff(auth.uid()));
+drop policy if exists "Editors manage trails" on public.trails;
+create policy "Editors manage trails" on public.trails for all to authenticated
+using (public.has_role(auth.uid(),'admin') or public.has_role(auth.uid(),'editor'))
+with check (public.has_role(auth.uid(),'admin') or public.has_role(auth.uid(),'editor'));
+
+drop policy if exists "Read events of published trails" on public.trail_events;
+create policy "Read events of published trails" on public.trail_events for select to anon, authenticated
+using (exists (select 1 from public.trails t where t.id = trail_id and (t.published or public.is_staff(auth.uid()))));
+drop policy if exists "Editors manage trail events" on public.trail_events;
+create policy "Editors manage trail events" on public.trail_events for all to authenticated
+using (public.has_role(auth.uid(),'admin') or public.has_role(auth.uid(),'editor'))
+with check (public.has_role(auth.uid(),'admin') or public.has_role(auth.uid(),'editor'));
+
+drop trigger if exists trails_touch on public.trails;
+create trigger trails_touch before update on public.trails for each row execute function public.touch_updated_at();
+
+-- Stories per month that match a trail's search.
+create or replace function public.trail_volume(_query text, _since date)
+returns table(month date, stories int, sources int)
+language sql stable set search_path = public as $$
+  select date_trunc('month', a.published_at)::date, count(*)::int, count(distinct a.source)::int
+  from public.news_archive a
+  where a.tsv_en @@ websearch_to_tsquery('english'::regconfig, _query) and (_since is null or a.published_at >= _since)
+  group by 1 order by 1
+$$;
+
+-- The best-matching few stories of each month, newest first.
+-- (a later step gives this function more columns, so it is dropped first to keep this script safe to run again)
+drop function if exists public.trail_stories(text, date, int, int);
+create or replace function public.trail_stories(_query text, _since date, _per_month int default 3, _max int default 150)
+returns table(id bigint, title text, source text, link text, published_at timestamptz)
+language sql stable set search_path = public as $$
+  select t.id, t.title, t.source, t.link, t.published_at from (
+    select a.id, a.title, a.source, a.link, a.published_at,
+      row_number() over (partition by date_trunc('month', a.published_at)
+        order by ts_rank(a.tsv_en, websearch_to_tsquery('english'::regconfig, _query)) desc, a.published_at desc) as rn
+    from public.news_archive a
+    where a.tsv_en @@ websearch_to_tsquery('english'::regconfig, _query) and (_since is null or a.published_at >= _since)
+  ) t
+  where t.rn <= _per_month
+  order by t.published_at desc
+  limit _max
+$$;
+
+-- Words that keep showing up beside the topic, to help refine or branch a trail.
+create or replace function public.trail_related(_query text, _since date, _limit int default 12)
+returns table(term text, stories int)
+language sql stable set search_path = public as $$
+  select u.lexeme::text, count(distinct a.id)::int
+  from public.news_archive a, unnest(a.tsv_title) as u(lexeme, positions, weights)
+  where a.tsv_en @@ websearch_to_tsquery('english'::regconfig, _query) and (_since is null or a.published_at >= _since)
+    and char_length(u.lexeme) >= 4 and u.lexeme !~ '[0-9]'
+    and not exists (select 1 from public.trend_stopwords s where s.word = u.lexeme)
+    and not (u.lexeme = any(tsvector_to_array(to_tsvector('simple'::regconfig, _query))))
+  group by u.lexeme
+  having count(distinct a.id) >= 2
+  order by 2 desc, 1
+  limit _limit
+$$;
+
+-- How many matching stories appeared after a moment (for "new since you last looked").
+create or replace function public.trail_count_since(_query text, _ts timestamptz)
+returns int language sql stable set search_path = public as $$
+  select count(*)::int from public.news_archive a
+  where a.published_at > _ts and a.published_at <= now() and a.tsv_en @@ websearch_to_tsquery('english'::regconfig, _query)
+$$;
+
+grant execute on function public.trending_terms(int, int), public.term_series(text[], int),
+  public.trail_volume(text, date), public.trail_stories(text, date, int, int),
+  public.trail_related(text, date, int), public.trail_count_since(text, timestamptz) to anon, authenticated;
+
+-- A starter trail; the editors' milestones are added in the admin page.
+insert into public.trails(slug, title, description, query, published)
+values ('floods-and-el-nino', 'Floods and El Niño',
+        'How floods, heavy rains and El Niño have been reported by Kenyan outlets, from the first warnings to the aftermath.',
+        'flood OR floods OR flooding OR "el nino" OR "el niño"', true)
+on conflict (slug) do nothing;
+
+
+-- 0004: safer team management.
+--  * Admin access can never be removed from the app (only by someone with direct database access).
+--  * Every role change needs a session verified with two-factor authentication (aal2).
+
+create or replace function public.is_aal2()
+returns boolean language sql stable as $$
+  select coalesce(auth.jwt() ->> 'aal', 'aal1') = 'aal2'
+$$;
+grant execute on function public.is_aal2() to authenticated;
+
+create or replace function public.grant_role_by_email(_email text, _role public.app_role)
+returns boolean language plpgsql security definer set search_path = public, auth as $$
+declare uid uuid;
+begin
+  if not public.has_role(auth.uid(), 'admin') then raise exception 'Admins only'; end if;
+  if not public.is_aal2() then raise exception 'Two-factor verification required: verify your authenticator code and try again.'; end if;
+  select id into uid from auth.users where lower(email) = lower(trim(_email)) limit 1;
+  if uid is null then return false; end if;
+  insert into public.user_roles(user_id, role) values (uid, _role) on conflict (user_id, role) do nothing;
+  insert into public.security_events(severity, type, detail, actor)
+    values (case when _role = 'admin' then 'critical' else 'notice' end, 'role_granted', trim(_email) || ' given ' || _role::text, auth.uid());
+  return true;
+end $$;
+revoke all on function public.grant_role_by_email(text, public.app_role) from public, anon;
+grant execute on function public.grant_role_by_email(text, public.app_role) to authenticated;
+
+create or replace function public.revoke_role(_user uuid, _role public.app_role)
+returns boolean language plpgsql security definer set search_path = public, auth as $$
+begin
+  if not public.has_role(auth.uid(), 'admin') then raise exception 'Admins only'; end if;
+  if not public.is_aal2() then raise exception 'Two-factor verification required: verify your authenticator code and try again.'; end if;
+  if _role = 'admin' then
+    raise exception 'Admin access cannot be removed from the app. It can only be changed directly in the database.';
+  end if;
+  delete from public.user_roles where user_id = _user and role = _role;
+  insert into public.security_events(severity, type, detail, actor)
+    values ('notice', 'role_revoked', _role::text || ' removed from ' || _user::text, auth.uid());
+  return true;
+end $$;
+revoke all on function public.revoke_role(uuid, public.app_role) from public, anon;
+grant execute on function public.revoke_role(uuid, public.app_role) to authenticated;
+
+
+-- 0005: AI-assisted trail research. The agent only writes through the server (service role);
+-- readers see items that are not rejected, and editors approve or reject them.
+
+create table if not exists public.trail_research (
+  id uuid primary key default gen_random_uuid(),
+  query_key text not null check (char_length(query_key) between 2 and 120),
+  query text not null check (char_length(query) between 2 and 200),
+  status text not null default 'running' check (status in ('running','done','failed')),
+  origin text not null default 'visitor' check (origin in ('visitor','staff','scheduled')),
+  items_found int not null default 0,
+  searches int not null default 0,
+  input_tokens int,
+  output_tokens int,
+  error text check (error is null or char_length(error) <= 400),
+  created_at timestamptz not null default now(),
+  finished_at timestamptz
+);
+create index if not exists trail_research_key_idx on public.trail_research (query_key, created_at desc);
+create index if not exists trail_research_day_idx on public.trail_research (created_at desc);
+-- Only one run per topic at a time.
+create unique index if not exists trail_research_one_running_idx on public.trail_research (query_key) where status = 'running';
+
+create table if not exists public.ai_trail_items (
+  id uuid primary key default gen_random_uuid(),
+  research_id uuid references public.trail_research(id) on delete cascade,
+  query_key text not null,
+  event_date date not null,
+  date_precision text not null default 'day' check (date_precision in ('day','month','year')),
+  title text not null check (char_length(title) between 3 and 200),
+  summary text not null default '' check (char_length(summary) <= 500),
+  url text not null check (url ~* '^https?://' and char_length(url) <= 1000),
+  publisher text not null default '' check (char_length(publisher) <= 120),
+  status text not null default 'unreviewed' check (status in ('unreviewed','approved','rejected')),
+  reviewed_by uuid,
+  reviewed_at timestamptz,
+  created_at timestamptz not null default now(),
+  unique (query_key, url)
+);
+create index if not exists ai_trail_items_key_idx on public.ai_trail_items (query_key, event_date);
+
+grant select on public.ai_trail_items to anon, authenticated;
+grant update, delete on public.ai_trail_items to authenticated;
+grant all on public.ai_trail_items to service_role;
+grant select on public.trail_research to authenticated;
+grant delete on public.trail_research to authenticated;
+grant all on public.trail_research to service_role;
+alter table public.ai_trail_items enable row level security;
+alter table public.trail_research enable row level security;
+
+drop policy if exists "Public reads non-rejected AI items" on public.ai_trail_items;
+create policy "Public reads non-rejected AI items" on public.ai_trail_items for select to anon, authenticated
+using (status in ('unreviewed','approved') or public.is_staff(auth.uid()));
+drop policy if exists "Editors review AI items" on public.ai_trail_items;
+create policy "Editors review AI items" on public.ai_trail_items for update to authenticated
+using (public.has_role(auth.uid(),'admin') or public.has_role(auth.uid(),'editor'))
+with check (public.has_role(auth.uid(),'admin') or public.has_role(auth.uid(),'editor'));
+drop policy if exists "Editors delete AI items" on public.ai_trail_items;
+create policy "Editors delete AI items" on public.ai_trail_items for delete to authenticated
+using (public.has_role(auth.uid(),'admin') or public.has_role(auth.uid(),'editor'));
+
+drop policy if exists "Staff read research runs" on public.trail_research;
+create policy "Staff read research runs" on public.trail_research for select to authenticated using (public.is_staff(auth.uid()));
+drop policy if exists "Editors delete research runs" on public.trail_research;
+create policy "Editors delete research runs" on public.trail_research for delete to authenticated
+using (public.has_role(auth.uid(),'admin') or public.has_role(auth.uid(),'editor'));
+
+-- Switches editors control from the admin page (public-readable, so no secrets here).
+insert into public.site_settings(key, value) values ('ai_trails', '{"enabled":true,"showUnreviewed":true}')
+on conflict (key) do nothing;
+
+
+-- 0006: automatic clean-up so the privacy policy's retention promises are real.
+--  * detailed visit and activity records: 24 months
+--  * security/audit log: 24 months
+--  * declined submissions: 12 months
+--  * contact details on approved submissions: removed 12 months after review
+create or replace function public.purge_old_records()
+returns jsonb language plpgsql security definer set search_path = public as $$
+declare a int; b int; c int; d int; e int;
+begin
+  delete from public.page_views where created_at < now() - interval '24 months'; get diagnostics a = row_count;
+  delete from public.site_events where created_at < now() - interval '24 months'; get diagnostics b = row_count;
+  delete from public.security_events where created_at < now() - interval '24 months'; get diagnostics c = row_count;
+  delete from public.aspirant_submissions where status = 'rejected' and coalesce(reviewed_at, created_at) < now() - interval '12 months'; get diagnostics d = row_count;
+  update public.aspirant_submissions
+     set contact_name = 'removed', contact_email = 'removed@removed.invalid', contact_phone = null, contact_role = null
+   where status = 'approved' and reviewed_at < now() - interval '12 months' and contact_email <> 'removed@removed.invalid';
+  get diagnostics e = row_count;
+  return jsonb_build_object('page_views', a, 'site_events', b, 'security_events', c, 'declined_submissions', d, 'contacts_removed', e);
+end $$;
+revoke all on function public.purge_old_records() from public, anon, authenticated;
+grant execute on function public.purge_old_records() to service_role;
+
+
+-- 0007: a board of what is trending on social platforms, curated by editors
+-- (TikTok, Instagram and others have no public trending feed for Kenya, so people note what they see).
+create table if not exists public.social_trends (
+  id uuid primary key default gen_random_uuid(),
+  platform text not null check (platform in ('x','tiktok','instagram','facebook','youtube','whatsapp','telegram','other')),
+  topic text not null check (char_length(topic) between 2 and 80),
+  note text not null default '' check (char_length(note) <= 240),
+  url text check (url is null or (url ~* '^https?://' and char_length(url) <= 1000)),
+  created_at timestamptz not null default now(),
+  expires_at timestamptz not null default (now() + interval '3 days'),
+  created_by uuid
+);
+create index if not exists social_trends_live_idx on public.social_trends (expires_at desc, created_at desc);
+grant select on public.social_trends to anon, authenticated;
+grant insert, update, delete on public.social_trends to authenticated;
+grant all on public.social_trends to service_role;
+alter table public.social_trends enable row level security;
+
+drop policy if exists "Read live social trends" on public.social_trends;
+create policy "Read live social trends" on public.social_trends for select to anon, authenticated
+using (expires_at > now() or public.is_staff(auth.uid()));
+drop policy if exists "Editors manage social trends" on public.social_trends;
+create policy "Editors manage social trends" on public.social_trends for all to authenticated
+using (public.has_role(auth.uid(),'admin') or public.has_role(auth.uid(),'editor'))
+with check (public.has_role(auth.uid(),'admin') or public.has_role(auth.uid(),'editor'));
+
+
+-- 0008: the team's pronunciation dictionary for the news bulletin voice.
+-- "word" is how it is written; "spoken" is how it should be said (a respelling the voice reads naturally).
+create table if not exists public.pronunciations (
+  word text primary key check (char_length(word) between 2 and 60 and word = btrim(word)),
+  spoken text not null check (char_length(spoken) between 1 and 120),
+  note text not null default '' check (char_length(note) <= 160),
+  created_at timestamptz not null default now()
+);
+grant select on public.pronunciations to anon, authenticated;
+grant insert, update, delete on public.pronunciations to authenticated;
+grant all on public.pronunciations to service_role;
+alter table public.pronunciations enable row level security;
+drop policy if exists "Public reads pronunciations" on public.pronunciations;
+create policy "Public reads pronunciations" on public.pronunciations for select to anon, authenticated using (true);
+drop policy if exists "Editors manage pronunciations" on public.pronunciations;
+create policy "Editors manage pronunciations" on public.pronunciations for all to authenticated
+using (public.has_role(auth.uid(),'admin') or public.has_role(auth.uid(),'editor'))
+with check (public.has_role(auth.uid(),'admin') or public.has_role(auth.uid(),'editor'));
+
+-- 0009: what trended in each past day, week or month (Kenya time), for the Trails page.
+-- Returns the top words per period. Periods with nothing notable come back once with a null term,
+-- so the page can still show them ("Nothing stood out") instead of silently skipping them.
+--   _unit     'day', 'week' (Monday to Sunday) or 'month'
+--   _periods  how many periods to return (1 to 60)
+--   _offset   how many periods to skip back from the current one (0 = start with the current period)
+--   _per      how many words to keep for each period (1 to 20)
+create or replace function public.trending_history(_unit text, _periods int, _offset int default 0, _per int default 8)
+returns table(period_start date, term text, stories int, sources int, rank int)
+language sql stable set search_path = public as $$
+  with p as (
+    select
+      case when _unit in ('day', 'week') then _unit else 'month' end as unit,
+      case _unit when 'day' then interval '1 day' when 'week' then interval '1 week' else interval '1 month' end as step,
+      greatest(1, least(coalesce(_periods, 7), 60)) as n,
+      greatest(0, least(coalesce(_offset, 0), 1000)) as skip,
+      greatest(1, least(coalesce(_per, 8), 20)) as per,
+      now() at time zone 'Africa/Nairobi' as local_now
+  ), b as (
+    select unit, step, per,
+      date_trunc(unit, local_now) - skip * step as newest,
+      date_trunc(unit, local_now) - (skip + n - 1) * step as oldest
+    from p
+  ), periods as (
+    select gs::date as start from b, generate_series(b.oldest, b.newest, b.step) as gs
+  ), in_range as (
+    select a.id, a.source, a.tsv_title,
+      date_trunc(b.unit, a.published_at at time zone 'Africa/Nairobi')::date as start
+    from b join public.news_archive a
+      on a.published_at >= (b.oldest at time zone 'Africa/Nairobi')
+     and a.published_at < (b.newest + b.step) at time zone 'Africa/Nairobi'
+     and a.published_at <= now()
+  ), t as (
+    select r.start, u.lexeme::text as term,
+      count(distinct r.id)::int as stories, count(distinct r.source)::int as sources
+    from in_range r, unnest(r.tsv_title) as u(lexeme, positions, weights)
+    where char_length(u.lexeme) >= 3 and u.lexeme !~ '[0-9]'
+      and not exists (select 1 from public.trend_stopwords s where s.word = u.lexeme)
+    group by r.start, u.lexeme
+    having count(distinct r.id) >= 2
+  ), ranked as (
+    select t.*, (row_number() over (partition by t.start order by t.stories desc, t.sources desc, t.term))::int as rank
+    from t
+  )
+  select periods.start, ranked.term, ranked.stories, ranked.sources, ranked.rank
+  from periods
+  left join ranked on ranked.start = periods.start and ranked.rank <= (select per from b)
+  order by periods.start desc, ranked.rank
+$$;
+
+grant execute on function public.trending_history(text, int, int, int) to anon, authenticated;
+
+-- 0010: editions. Brief covers many countries, so every archived headline now says which edition ("world" or a
+-- country code such as 'KE') it was found in, and trends and trending history can be asked about one edition.
+-- Everything saved before this migration came from the Kenya feeds, so it is labelled 'KE'.
+
+alter table public.news_archive add column if not exists edition text not null default 'KE';
+alter table public.news_archive alter column edition set default 'world';
+create index if not exists news_archive_edition_published_idx on public.news_archive (edition, published_at desc);
+
+-- Words that appear in nearly every headline of one country ("Nigeria", "Lagos"), so they are ignored there
+-- but can still trend in the world edition. Editors can add rows here in the Supabase table editor.
+create table if not exists public.edition_stopwords (
+  edition text not null check (char_length(edition) between 2 and 8),
+  word text not null check (word = lower(word) and char_length(word) between 2 and 40),
+  primary key (edition, word)
+);
+grant select on public.edition_stopwords to anon, authenticated;
+grant insert, delete on public.edition_stopwords to authenticated;
+grant all on public.edition_stopwords to service_role;
+alter table public.edition_stopwords enable row level security;
+drop policy if exists "Public reads edition stopwords" on public.edition_stopwords;
+create policy "Public reads edition stopwords" on public.edition_stopwords for select to anon, authenticated using (true);
+drop policy if exists "Staff manage edition stopwords" on public.edition_stopwords;
+create policy "Staff manage edition stopwords" on public.edition_stopwords for all to authenticated
+using (public.has_role(auth.uid(),'admin') or public.has_role(auth.uid(),'editor') or public.has_role(auth.uid(),'moderator'))
+with check (public.has_role(auth.uid(),'admin') or public.has_role(auth.uid(),'editor') or public.has_role(auth.uid(),'moderator'));
+
+insert into public.edition_stopwords(edition, word) values
+  ('KE','kenya'),('KE','kenyan'),('KE','kenyans'),('KE','nairobi'),
+  ('UG','uganda'),('UG','ugandan'),('UG','ugandans'),('UG','kampala'),
+  ('TZ','tanzania'),('TZ','tanzanian'),('TZ','tanzanians'),('TZ','dodoma'),
+  ('NG','nigeria'),('NG','nigerian'),('NG','nigerians'),('NG','lagos'),('NG','abuja'),
+  ('GH','ghana'),('GH','ghanaian'),('GH','ghanaians'),('GH','accra'),
+  ('ZA','south'),('ZA','african'),('ZA','africans'),('ZA','pretoria'),
+  ('GB','britain'),('GB','british'),('GB','london'),('GB','england'),
+  ('US','america'),('US','american'),('US','americans'),('US','united'),('US','states'),('US','washington'),
+  ('IN','india'),('IN','indian'),('IN','indians'),('IN','delhi'),
+  ('AU','australia'),('AU','australian'),('AU','australians'),('AU','sydney'),
+  ('CA','canada'),('CA','canadian'),('CA','canadians'),('CA','ottawa'),('CA','toronto')
+on conflict do nothing;
+-- Kenya's own words used to be ignored everywhere. Now they are ignored only in the Kenya edition.
+delete from public.trend_stopwords where word in ('kenya','kenyan','kenyans','nairobi');
+
+-- ---------- Trending analysis, per edition ----------
+-- _edition null means every edition together.
+drop function if exists public.trending_terms(int, int);
+create or replace function public.trending_terms(_days int, _limit int default 150, _edition text default null)
+returns table(term text, stories int, sources int, prev_stories int)
+language sql stable set search_path = public as $$
+  with cur as (
+    select a.id, a.source, a.tsv_title from public.news_archive a
+    where a.published_at >= now() - make_interval(days => _days) and a.published_at <= now()
+      and (_edition is null or a.edition = _edition)
+  ), prev as (
+    select a.id, a.tsv_title from public.news_archive a
+    where a.published_at >= now() - make_interval(days => _days * 2) and a.published_at < now() - make_interval(days => _days)
+      and (_edition is null or a.edition = _edition)
+  ), c as (
+    select u.lexeme::text as term, count(distinct cur.id)::int as stories, count(distinct cur.source)::int as sources
+    from cur, unnest(cur.tsv_title) as u(lexeme, positions, weights)
+    where char_length(u.lexeme) >= 3 and u.lexeme !~ '[0-9]'
+      and not exists (select 1 from public.trend_stopwords s where s.word = u.lexeme)
+      and not exists (select 1 from public.edition_stopwords e where e.edition = _edition and e.word = u.lexeme)
+    group by u.lexeme
+    having count(distinct cur.id) >= 2
+  ), p as (
+    select u.lexeme::text as term, count(distinct prev.id)::int as stories
+    from prev, unnest(prev.tsv_title) as u(lexeme, positions, weights)
+    group by u.lexeme
+  )
+  select c.term, c.stories, c.sources, coalesce(p.stories, 0)::int
+  from c left join p on p.term = c.term
+  order by c.stories desc, c.sources desc, c.term
+  limit _limit
+$$;
+
+drop function if exists public.term_series(text[], int);
+create or replace function public.term_series(_terms text[], _days int, _edition text default null)
+returns table(term text, bucket date, stories int)
+language sql stable set search_path = public as $$
+  select u.lexeme::text,
+    (case when _days <= 31 then date_trunc('day', a.published_at)
+          when _days <= 120 then date_trunc('week', a.published_at)
+          else date_trunc('month', a.published_at) end)::date,
+    count(distinct a.id)::int
+  from public.news_archive a, unnest(a.tsv_title) as u(lexeme, positions, weights)
+  where a.published_at >= now() - make_interval(days => _days) and a.published_at <= now() and u.lexeme = any(_terms)
+    and (_edition is null or a.edition = _edition)
+  group by 1, 2
+  order by 1, 2
+$$;
+
+-- ---------- What trended in each past day, week or month, per edition and in that edition's time zone ----------
+drop function if exists public.trending_history(text, int, int, int);
+create or replace function public.trending_history(_unit text, _periods int, _offset int default 0, _per int default 8, _edition text default null, _tz text default 'UTC')
+returns table(period_start date, term text, stories int, sources int, rank int)
+language sql stable set search_path = public as $$
+  with p as (
+    select
+      case when _unit in ('day', 'week') then _unit else 'month' end as unit,
+      case _unit when 'day' then interval '1 day' when 'week' then interval '1 week' else interval '1 month' end as step,
+      greatest(1, least(coalesce(_periods, 7), 60)) as n,
+      greatest(0, least(coalesce(_offset, 0), 1000)) as skip,
+      greatest(1, least(coalesce(_per, 8), 20)) as per,
+      coalesce(_tz, 'UTC') as tz,
+      now() at time zone coalesce(_tz, 'UTC') as local_now
+  ), b as (
+    select unit, step, per, tz,
+      date_trunc(unit, local_now) - skip * step as newest,
+      date_trunc(unit, local_now) - (skip + n - 1) * step as oldest
+    from p
+  ), periods as (
+    select gs::date as start from b, generate_series(b.oldest, b.newest, b.step) as gs
+  ), in_range as (
+    select a.id, a.source, a.tsv_title,
+      date_trunc(b.unit, a.published_at at time zone b.tz)::date as start
+    from b join public.news_archive a
+      on a.published_at >= (b.oldest at time zone b.tz)
+     and a.published_at < (b.newest + b.step) at time zone b.tz
+     and a.published_at <= now()
+     and (_edition is null or a.edition = _edition)
+  ), t as (
+    select r.start, u.lexeme::text as term,
+      count(distinct r.id)::int as stories, count(distinct r.source)::int as sources
+    from in_range r, unnest(r.tsv_title) as u(lexeme, positions, weights)
+    where char_length(u.lexeme) >= 3 and u.lexeme !~ '[0-9]'
+      and not exists (select 1 from public.trend_stopwords s where s.word = u.lexeme)
+      and not exists (select 1 from public.edition_stopwords e where e.edition = _edition and e.word = u.lexeme)
+    group by r.start, u.lexeme
+    having count(distinct r.id) >= 2
+  ), ranked as (
+    select t.*, (row_number() over (partition by t.start order by t.stories desc, t.sources desc, t.term))::int as rank
+    from t
+  )
+  select periods.start, ranked.term, ranked.stories, ranked.sources, ranked.rank
+  from periods
+  left join ranked on ranked.start = periods.start and ranked.rank <= (select per from b)
+  order by periods.start desc, ranked.rank
+$$;
+
+grant execute on function public.trending_terms(int, int, text), public.term_series(text[], int, text),
+  public.trending_history(text, int, int, int, text, text) to anon, authenticated;
+
+-- 0011: regions. Staff can be limited to the editions (countries) they look after, and ads can target editions.
+--   staff_regions  which editions a staff member manages. The edition '*' means all of them (and global settings).
+--   Admins always manage everything. Editors and moderators manage only what their rows allow, and nothing without a row.
+
+-- Created, and seeded with the current staff, only the first time this runs. Running the script again never undoes an admin's changes.
+do $$
+begin
+  if to_regclass('public.staff_regions') is null then
+    create table public.staff_regions (
+      user_id uuid not null references auth.users(id) on delete cascade,
+      edition text not null check (edition = '*' or edition ~ '^[A-Za-z]{2}$' or edition = 'world'),
+      primary key (user_id, edition)
+    );
+    -- Everyone who was an editor or moderator before regions existed keeps working on everything until an admin narrows them.
+    insert into public.staff_regions(user_id, edition)
+    select distinct r.user_id, '*' from public.user_roles r
+    where r.role::text in ('editor', 'moderator') and exists (select 1 from auth.users u where u.id = r.user_id);
+  end if;
+end $$;
+grant select on public.staff_regions to authenticated;
+grant all on public.staff_regions to service_role;
+alter table public.staff_regions enable row level security;
+drop policy if exists "Staff read own regions" on public.staff_regions;
+create policy "Staff read own regions" on public.staff_regions for select to authenticated
+using (user_id = auth.uid() or public.has_role(auth.uid(), 'admin'));
+
+-- Can this person manage something that belongs to these editions? An empty list means "global" (not tied to one edition).
+-- _roles are the roles allowed to do this kind of work; admins always pass.
+create or replace function public.can_manage(_user uuid, _editions text[], _roles text[] default array['admin','editor'])
+returns boolean language sql stable security definer set search_path = public as $$
+  select public.has_role(_user, 'admin')
+    or (
+      exists (select 1 from public.user_roles r where r.user_id = _user and r.role::text = any(_roles))
+      and (
+        exists (select 1 from public.staff_regions s where s.user_id = _user and s.edition = '*')
+        or (
+          coalesce(cardinality(_editions), 0) > 0
+          and not exists (
+            select 1 from unnest(_editions) e
+            where not exists (select 1 from public.staff_regions s where s.user_id = _user and s.edition = e)
+          )
+        )
+      )
+    )
+$$;
+grant execute on function public.can_manage(uuid, text[], text[]) to authenticated;
+
+-- Ads can be shown in some editions only. An empty list means everywhere.
+alter table public.ads add column if not exists editions text[] not null default '{}';
+drop policy if exists "Admins/editors manage ads" on public.ads;
+drop policy if exists "Staff manage ads" on public.ads;
+create policy "Staff manage ads" on public.ads for all to authenticated
+using (public.can_manage(auth.uid(), editions))
+with check (public.can_manage(auth.uid(), editions));
+
+-- Settings: global keys need a global editor (or admin). Content rules and the banner can also be set for one edition,
+-- stored under keys like 'content@NG' and 'banner@NG', by whoever manages that edition.
+create or replace function public.can_write_setting(_user uuid, _key text)
+returns boolean language sql stable security definer set search_path = public as $$
+  select case
+    when position('@' in _key) > 0 then
+      split_part(_key, '@', 1) in ('content', 'banner')
+      and split_part(_key, '@', 2) <> ''
+      and public.can_manage(_user, array[split_part(_key, '@', 2)],
+            case when split_part(_key, '@', 1) = 'content' then array['admin','editor','moderator'] else array['admin','editor'] end)
+    else
+      public.can_manage(_user, '{}'::text[], case when _key = 'content' then array['admin','editor','moderator'] else array['admin','editor'] end)
+  end
+$$;
+grant execute on function public.can_write_setting(uuid, text) to authenticated;
+drop policy if exists "Admins/editors write settings" on public.site_settings;
+drop policy if exists "Moderators write content rules" on public.site_settings;
+drop policy if exists "Staff write settings" on public.site_settings;
+create policy "Staff write settings" on public.site_settings for all to authenticated
+using (public.can_write_setting(auth.uid(), key))
+with check (public.can_write_setting(auth.uid(), key));
+
+-- The editors' social board can be for one edition ('*' = every edition).
+alter table public.social_trends add column if not exists edition text not null default '*';
+drop policy if exists "Editors manage social trends" on public.social_trends;
+create policy "Editors manage social trends" on public.social_trends for all to authenticated
+using (public.can_manage(auth.uid(), case when edition = '*' then '{}'::text[] else array[edition] end))
+with check (public.can_manage(auth.uid(), case when edition = '*' then '{}'::text[] else array[edition] end));
+
+-- Admin tools to see and set who manages which edition (two-factor verified, like the other team tools).
+create or replace function public.list_staff_regions()
+returns table(user_id uuid, edition text)
+language plpgsql security definer set search_path = public as $$
+begin
+  if not public.has_role(auth.uid(), 'admin') then raise exception 'Admins only'; end if;
+  return query select s.user_id, s.edition from public.staff_regions s order by s.user_id, s.edition;
+end $$;
+revoke all on function public.list_staff_regions() from public, anon;
+grant execute on function public.list_staff_regions() to authenticated;
+
+create or replace function public.set_staff_regions(_user uuid, _editions text[])
+returns boolean language plpgsql security definer set search_path = public, auth as $$
+declare e text;
+begin
+  if not public.has_role(auth.uid(), 'admin') then raise exception 'Admins only'; end if;
+  if not public.is_aal2() then raise exception 'Two-factor verification required: verify your authenticator code and try again.'; end if;
+  if not exists (select 1 from public.user_roles r where r.user_id = _user) then return false; end if;
+  foreach e in array coalesce(_editions, '{}') loop
+    if not (e = '*' or e = 'world' or e ~ '^[A-Za-z]{2}$') then raise exception 'Unknown edition: %', e; end if;
+  end loop;
+  delete from public.staff_regions where user_id = _user;
+  insert into public.staff_regions(user_id, edition) select _user, x from unnest(coalesce(_editions, '{}')) as x on conflict do nothing;
+  insert into public.security_events(severity, type, detail, actor)
+    values ('notice', 'regions_set', _user::text || ' now manages: ' || coalesce(nullif(array_to_string(_editions, ', '), ''), 'nothing'), auth.uid());
+  return true;
+end $$;
+revoke all on function public.set_staff_regions(uuid, text[]) from public, anon;
+grant execute on function public.set_staff_regions(uuid, text[]) to authenticated;
+
+-- 0012: trail stories carry what the story cards need (summary, category, outlet type, edition), so a trail
+-- can show each story the way the home page does.
+drop function if exists public.trail_stories(text, date, int, int);
+create or replace function public.trail_stories(_query text, _since date, _per_month int default 3, _max int default 150)
+returns table(id bigint, title text, source text, link text, published_at timestamptz, summary text, category text, platform text, edition text)
+language sql stable set search_path = public as $$
+  select t.id, t.title, t.source, t.link, t.published_at, t.summary, t.category, t.platform, t.edition from (
+    select a.id, a.title, a.source, a.link, a.published_at, a.summary, a.category, a.platform, a.edition,
+      row_number() over (partition by date_trunc('month', a.published_at)
+        order by ts_rank(a.tsv_en, websearch_to_tsquery('english'::regconfig, _query)) desc, a.published_at desc) as rn
+    from public.news_archive a
+    where a.tsv_en @@ websearch_to_tsquery('english'::regconfig, _query) and (_since is null or a.published_at >= _since)
+  ) t
+  where t.rn <= _per_month
+  order by t.published_at desc
+  limit _max
+$$;
+grant execute on function public.trail_stories(text, date, int, int) to anon, authenticated;
+
+-- 0013: other languages. Editions can now be a country in a second language (for example 'KE-sw'), and the
+-- language editions need to ignore their own everyday words ("le", "de", "na", "que") when finding what trends.
+
+-- Edition codes may carry a language: 'KE-sw'.
+alter table public.staff_regions drop constraint if exists staff_regions_edition_check;
+alter table public.staff_regions add constraint staff_regions_edition_check
+  check (edition = '*' or edition = 'world' or edition ~ '^[A-Za-z]{2}(-[A-Za-z]{2})?$');
+
+create or replace function public.set_staff_regions(_user uuid, _editions text[])
+returns boolean language plpgsql security definer set search_path = public, auth as $$
+declare e text;
+begin
+  if not public.has_role(auth.uid(), 'admin') then raise exception 'Admins only'; end if;
+  if not public.is_aal2() then raise exception 'Two-factor verification required: verify your authenticator code and try again.'; end if;
+  if not exists (select 1 from public.user_roles r where r.user_id = _user) then return false; end if;
+  foreach e in array coalesce(_editions, '{}') loop
+    if not (e = '*' or e = 'world' or e ~ '^[A-Za-z]{2}(-[A-Za-z]{2})?$') then raise exception 'Unknown edition: %', e; end if;
+  end loop;
+  delete from public.staff_regions where user_id = _user;
+  insert into public.staff_regions(user_id, edition) select _user, x from unnest(coalesce(_editions, '{}')) as x on conflict do nothing;
+  insert into public.security_events(severity, type, detail, actor)
+    values ('notice', 'regions_set', _user::text || ' now manages: ' || coalesce(nullif(array_to_string(_editions, ', '), ''), 'nothing'), auth.uid());
+  return true;
+end $$;
+revoke all on function public.set_staff_regions(uuid, text[]) from public, anon;
+grant execute on function public.set_staff_regions(uuid, text[]) to authenticated;
+
+-- Each country's own name (and its capital) is in nearly every headline there, so it is ignored in that edition.
+insert into public.edition_stopwords(edition, word) values
+  ('FR','france'),('FR','français'),('FR','française'),('FR','paris'),
+  ('ES','españa'),('ES','español'),('ES','española'),('ES','madrid'),
+  ('MX','méxico'),('MX','mexicano'),('MX','mexicana'),('MX','mexicanos'),
+  ('BR','brasil'),('BR','brasileiro'),('BR','brasileira'),('BR','brasileiros'),('BR','brasília'),
+  ('SN','sénégal'),('SN','sénégalais'),('SN','dakar'),
+  ('CI','ivoire'),('CI','ivoirien'),('CI','ivoirienne'),('CI','abidjan'),
+  ('KE-sw','kenya'),('KE-sw','nairobi'),('KE-sw','wakenya'),('KE-sw','mkenya'),
+  ('TZ-sw','tanzania'),('TZ-sw','dodoma'),('TZ-sw','watanzania'),('TZ-sw','salaam')
+on conflict do nothing;
+
+-- Everyday words of each language, for the editions written in it.
+insert into public.edition_stopwords(edition, word)
+select e, w from (values
+  ('fr', array['les','des','une','aux','pour','par','dans','avec','sans','sont','été','être','ont','cette','ces','son','ses','leur','leurs','plus','mais','dont','comme','aussi','après','avant','selon','entre','depuis','contre','encore','alors','tout','tous','toute','toutes','fait','déjà','très','peut','pas','sous','chez','vers','lors','puis','donc','ainsi','cela','celui','elle','elles','ils','nous','vous','qui','que','quoi','sur','est','mon','ton','notre','votre','lui','même','sera','peu','sans','où']),
+  ('es', array['los','las','del','para','por','con','sin','una','uno','unos','unas','que','como','más','pero','sus','este','esta','estos','estas','ese','esa','también','después','antes','sobre','entre','desde','hasta','cuando','donde','porque','muy','fue','ser','son','han','sido','será','tras','según','todo','todos','toda','todas','hay','año','años','día','días','nuevo','nueva','tiene','tienen','está','están','puede','sino','aunque','ante','bajo','cada','otro','otra','otros','otras','así','pues','ahora']),
+  ('pt', array['uma','uns','umas','para','por','com','sem','que','como','mais','mas','seus','suas','este','esta','estes','estas','esse','essa','também','depois','antes','sobre','entre','desde','até','quando','onde','porque','muito','foi','ser','são','tem','têm','será','após','segundo','todo','todos','toda','todas','há','ano','anos','dia','dias','novo','nova','pelo','pela','pelos','pelas','dos','das','nos','nas','está','estão','pode','apenas','ainda','nesta','neste','sobre','cada','outro','outra','outros','outras','assim','agora']),
+  ('sw', array['kwa','ya','wa','za','la','katika','kuwa','hii','huo','hizo','ambao','ambayo','ambaye','kuhusu','baada','kabla','pamoja','wakati','lakini','pia','sana','hivyo','wake','wao','yake','yao','yetu','wetu','hapo','huko','kila','moja','mbili','tatu','mwaka','miaka','leo','jana','kesho','sasa','bado','tena','hata','kama','kwamba','alisema','walisema','amesema','huu','hiyo','hizi','hawa','yule','ndani','nje','juu','chini','sababu','watu','mtu','kutoka','hadi','kati','vya','cha','ili','ndio','siku','zaidi','ndiyo','wakati'])
+) as l(lang, words)
+cross join lateral unnest(l.words) as w
+join (values ('fr','FR'),('fr','SN'),('fr','CI'),('es','ES'),('es','MX'),('pt','BR'),('sw','KE-sw'),('sw','TZ-sw')) as m(lang, e) on m.lang = l.lang
+on conflict do nothing;
+
+-- 0014: Arabic and Hindi. Their editions ignore their own everyday words and country names when finding what trends,
+-- and a "topic" is never a number in any script (Arabic-Indic and Devanagari digits were slipping through).
+
+-- Each country's own name (and its capital) is in nearly every headline there.
+insert into public.edition_stopwords(edition, word) values
+  ('EG','مصر'),('EG','مصري'),('EG','مصرية'),('EG','المصرية'),('EG','المصري'),('EG','القاهرة'),
+  ('SA','السعودية'),('SA','سعودي'),('SA','سعودية'),('SA','السعودي'),('SA','الرياض'),('SA','المملكة'),
+  ('IN-hi','भारत'),('IN-hi','भारतीय'),('IN-hi','दिल्ली')
+on conflict do nothing;
+
+-- Everyday words of each language, for the editions written in it.
+insert into public.edition_stopwords(edition, word)
+select m.e, w
+from (values ('ar', array['أقل','أكثر','أمس','أن','أو','أي','أيضا','أيضاً','إلى','إن','التي','الذي','الذين','العام','اليوم','بعد','بعض','به','بها','بين','تلك','ثم','حتى','خلال','ذلك','عام','على','عليه','عليها','عن','عند','غدا','غير','في','فيه','فيها','قال','قالت','قبل','قد','كان','كانت','كل','كما','لا','لدى','لكن','لم','لن','له','لها','لهم','ما','مصدر','مع','من','منذ','منه','منها','نحو','هذا','هذه','هل','هم','هنا','هناك','هو','هي','وأضاف','وأعلن','وأكد','وإلى','وعلى','وعن','وفي','وقال','وقد','ومع','ومن','يكون']), ('hi', array['अगर','अपने','अब','आज','इस','उन','उस','एक','और','कर','करना','करने','कल','कहा','कहां','का','कि','किया','की','कुछ','के','कैसे','को','क्या','गई','गए','गया','चार','जब','जा','जो','ज्यादा','तक','तब','तरह','तीन','तो','था','थी','थे','दिन','दिया','दी','दे','दो','द्वारा','नए','नया','नहीं','ने','पर','पहले','पूरा','पूरी','फिर','बताया','बहुत','बाद','बीच','भी','मामला','मामले','में','यह','यहां','या','रहा','रही','रहे','लिए','लिया','ली','लेकिन','वर्ष','वह','वहां','वाली','वाले','वालों','सकता','सकती','सकते','सबसे','सभी','साथ','साल','से','हुआ','हुई','हुए','है','हैं','हो','होगा','होने'])) as l(lang, words)
+cross join lateral unnest(l.words) as w
+join (values ('ar','EG'),('ar','SA'),('hi','IN-hi')) as m(lang, e) on m.lang = l.lang
+on conflict do nothing;
+
+create or replace function public.trending_terms(_days int, _limit int default 150, _edition text default null)
+returns table(term text, stories int, sources int, prev_stories int)
+language sql stable set search_path = public as $$
+  with cur as (
+    select a.id, a.source, a.tsv_title from public.news_archive a
+    where a.published_at >= now() - make_interval(days => _days) and a.published_at <= now()
+      and (_edition is null or a.edition = _edition)
+  ), prev as (
+    select a.id, a.tsv_title from public.news_archive a
+    where a.published_at >= now() - make_interval(days => _days * 2) and a.published_at < now() - make_interval(days => _days)
+      and (_edition is null or a.edition = _edition)
+  ), c as (
+    select u.lexeme::text as term, count(distinct cur.id)::int as stories, count(distinct cur.source)::int as sources
+    from cur, unnest(cur.tsv_title) as u(lexeme, positions, weights)
+    where char_length(u.lexeme) >= 3 and u.lexeme !~ '[0-9٠-٩۰-۹०-९]'
+      and not exists (select 1 from public.trend_stopwords s where s.word = u.lexeme)
+      and not exists (select 1 from public.edition_stopwords e where e.edition = _edition and e.word = u.lexeme)
+    group by u.lexeme
+    having count(distinct cur.id) >= 2
+  ), p as (
+    select u.lexeme::text as term, count(distinct prev.id)::int as stories
+    from prev, unnest(prev.tsv_title) as u(lexeme, positions, weights)
+    group by u.lexeme
+  )
+  select c.term, c.stories, c.sources, coalesce(p.stories, 0)::int
+  from c left join p on p.term = c.term
+  order by c.stories desc, c.sources desc, c.term
+  limit _limit
+$$;
+
+create or replace function public.trending_history(_unit text, _periods int, _offset int default 0, _per int default 8, _edition text default null, _tz text default 'UTC')
+returns table(period_start date, term text, stories int, sources int, rank int)
+language sql stable set search_path = public as $$
+  with p as (
+    select
+      case when _unit in ('day', 'week') then _unit else 'month' end as unit,
+      case _unit when 'day' then interval '1 day' when 'week' then interval '1 week' else interval '1 month' end as step,
+      greatest(1, least(coalesce(_periods, 7), 60)) as n,
+      greatest(0, least(coalesce(_offset, 0), 1000)) as skip,
+      greatest(1, least(coalesce(_per, 8), 20)) as per,
+      coalesce(_tz, 'UTC') as tz,
+      now() at time zone coalesce(_tz, 'UTC') as local_now
+  ), b as (
+    select unit, step, per, tz,
+      date_trunc(unit, local_now) - skip * step as newest,
+      date_trunc(unit, local_now) - (skip + n - 1) * step as oldest
+    from p
+  ), periods as (
+    select gs::date as start from b, generate_series(b.oldest, b.newest, b.step) as gs
+  ), in_range as (
+    select a.id, a.source, a.tsv_title,
+      date_trunc(b.unit, a.published_at at time zone b.tz)::date as start
+    from b join public.news_archive a
+      on a.published_at >= (b.oldest at time zone b.tz)
+     and a.published_at < (b.newest + b.step) at time zone b.tz
+     and a.published_at <= now()
+     and (_edition is null or a.edition = _edition)
+  ), t as (
+    select r.start, u.lexeme::text as term,
+      count(distinct r.id)::int as stories, count(distinct r.source)::int as sources
+    from in_range r, unnest(r.tsv_title) as u(lexeme, positions, weights)
+    where char_length(u.lexeme) >= 3 and u.lexeme !~ '[0-9٠-٩۰-۹०-९]'
+      and not exists (select 1 from public.trend_stopwords s where s.word = u.lexeme)
+      and not exists (select 1 from public.edition_stopwords e where e.edition = _edition and e.word = u.lexeme)
+    group by r.start, u.lexeme
+    having count(distinct r.id) >= 2
+  ), ranked as (
+    select t.*, (row_number() over (partition by t.start order by t.stories desc, t.sources desc, t.term))::int as rank
+    from t
+  )
+  select periods.start, ranked.term, ranked.stories, ranked.sources, ranked.rank
+  from periods
+  left join ranked on ranked.start = periods.start and ranked.rank <= (select per from b)
+  order by periods.start desc, ranked.rank
+$$;
+
+-- 0015: curated trails belong to a region. A trail can be for one edition (a country) or for all of them (empty),
+-- and staff manage the trails of the regions they look after, like ads and content rules.
+
+-- Added, and the original Kenyan trail tagged, only the first time this runs, so running the script again never undoes an admin's change.
+do $$
+begin
+  if not exists (select 1 from information_schema.columns where table_schema = 'public' and table_name = 'trails' and column_name = 'edition') then
+    alter table public.trails add column edition text;
+    update public.trails set edition = 'KE' where slug = 'floods-and-el-nino';
+  end if;
+end $$;
+
+drop policy if exists "Editors manage trails" on public.trails;
+drop policy if exists "Staff manage trails" on public.trails;
+create policy "Staff manage trails" on public.trails for all to authenticated
+using (public.can_manage(auth.uid(), case when edition is null then '{}'::text[] else array[edition] end))
+with check (public.can_manage(auth.uid(), case when edition is null then '{}'::text[] else array[edition] end));
+
+drop policy if exists "Editors manage trail events" on public.trail_events;
+drop policy if exists "Staff manage trail events" on public.trail_events;
+create policy "Staff manage trail events" on public.trail_events for all to authenticated
+using (exists (select 1 from public.trails t where t.id = trail_id and public.can_manage(auth.uid(), case when t.edition is null then '{}'::text[] else array[t.edition] end)))
+with check (exists (select 1 from public.trails t where t.id = trail_id and public.can_manage(auth.uid(), case when t.edition is null then '{}'::text[] else array[t.edition] end)));

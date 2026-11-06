@@ -1,0 +1,21 @@
+# Caddy gets and renews the https certificate by itself, and passes visitors on to Brief.
+# Replace example.com with your domain. Put this file at /etc/caddy/Caddyfile, then: sudo systemctl reload caddy
+# If you use Cloudflare in front, keep its proxy (orange cloud) on and set SSL/TLS mode to "Full (strict)".
+www.example.com {
+	redir https://example.com{uri} permanent
+}
+
+example.com {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:3000
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+	# Pages that change every few minutes should not be kept by browsers; the built files have fingerprints and can be.
+	@assets path /assets/*
+	header @assets Cache-Control "public, max-age=31536000, immutable"
+}

@@ -1,0 +1,24 @@
+# The alternative to pm2: let the server's own service manager run Brief.
+#   sudo cp deploy/brief.service /etc/systemd/system/brief.service     (edit the paths and user first)
+#   sudo systemctl daemon-reload && sudo systemctl enable --now brief
+#   journalctl -u brief -f        shows the log
+[Unit]
+Description=Brief news site
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=brief
+WorkingDirectory=/srv/brief
+ExecStart=/usr/bin/node scripts/start.mjs
+Environment=NODE_ENV=production
+Restart=always
+RestartSec=3
+# Small hardening: Brief only needs to read its own folder.
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

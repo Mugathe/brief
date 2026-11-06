@@ -1,0 +1,13 @@
+{
+  "name": "brief-studio-renderer",
+  "private": true,
+  "type": "module",
+  "description": "Renders Brief's top-story pictures and reels on a server (GitHub Actions), with no browser.",
+  "dependencies": {
+    "@fontsource/fraunces": "^5.1.0",
+    "@fontsource/ibm-plex-sans": "^5.1.0",
+    "@napi-rs/canvas": "^0.1.65",
+    "ffmpeg-static": "^5.2.0",
+    "node-web-audio-api": "^0.21.0"
+  }
+}
