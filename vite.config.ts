@@ -12,4 +12,6 @@ export default defineConfig({
     // nitro/vite builds from this
     server: { entry: "server" },
   },
+  // Lets the dev server answer through a tunnel such as ngrok (otherwise Vite replies 403 "Blocked request").
+  vite: { server: { allowedHosts: true } },
 });
