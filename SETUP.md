@@ -198,9 +198,3 @@ Both are optional and off until you add the keys below as **secrets on the serve
 5. **Important:** Google keeps videos uploaded through an API project that has not passed its audit **private**, whatever the upload asks for. Until you apply for and pass the audit (search "YouTube API Services compliance audit"), reels will arrive on the channel as private and you would publish them by hand. Uploads also use a daily quota, so a busy day can hit the limit.
 
 Add a secret on Cloudflare with `npx wrangler secret put NAME`, or in the dashboard under Settings -> Variables and Secrets (choose "Secret").
-git init
-git add .
-git commit -m "Initial commit"
-git branch -M main
-git remote add origin https://github.com/mugathe/YOUR-REPO-NAME.git
-git push -u origin main

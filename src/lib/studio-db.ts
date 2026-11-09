@@ -12,7 +12,7 @@ export type StudioPost = {
   /** Where this has been posted: { facebook: { id, at }, youtube: { id, at } }. */
   shared: Record<string, { id: string; at: string }>;
 };
-export type StudioGroup = { key: string; at: number; title: string; category: string; caption: string; link: string; status: StudioPost["status"]; image?: StudioPost; video?: StudioPost; posts: StudioPost[] };
+export type StudioGroup = { key: string; at: number; style: StudioPost["style"]; title: string; category: string; caption: string; link: string; status: StudioPost["status"]; image?: StudioPost; video?: StudioPost; posts: StudioPost[] };
 
 const COLUMNS = "id, edition, story_key, kind, style, title, category, caption, link, media_url, media_path, mime, status, created_at, published_at, shared";
 
@@ -40,7 +40,7 @@ export async function saveStudioPost(i: SaveInput): Promise<void> {
 export function groupPosts(posts: StudioPost[]): StudioGroup[] {
   const map = new Map<string, StudioGroup>();
   for (const p of posts) {
-    const g = map.get(p.story_key) ?? { key: p.story_key, at: 0, title: p.title, category: p.category, caption: p.caption, link: p.link, status: p.status, posts: [] };
+    const g = map.get(p.story_key) ?? { key: p.story_key, at: 0, style: p.style, title: p.title, category: p.category, caption: p.caption, link: p.link, status: p.status, posts: [] };
     g.posts.push(p);
     g.at = Math.max(g.at, new Date(p.published_at ?? p.created_at).getTime());
     if (p.kind === "image") g.image = p; else g.video = p;

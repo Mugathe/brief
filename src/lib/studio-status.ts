@@ -6,14 +6,14 @@ export const KEEP_MS = 7 * 86_400_000;
 export const IMAGE_MS = 4_500;
 
 export type Slide = { kind: "image" | "video"; url: string };
-export type Status = { key: string; title: string; category: string; link: string; caption: string; at: number; fresh: boolean; seen: boolean; cover: string | null; slides: Slide[] };
+export type Status = { key: string; style: StudioGroup["style"]; title: string; category: string; link: string; caption: string; at: number; fresh: boolean; seen: boolean; cover: string | null; slides: Slide[] };
 
 /** Fresh and unseen first, then fresh and seen, then expired; newest first inside each. */
 export function toStatuses(groups: StudioGroup[], now: number, seen: ReadonlySet<string>): Status[] {
   return groups
     .filter((g) => now - g.at < KEEP_MS && (g.image || g.video))
     .map((g): Status => ({
-      key: g.key, title: g.title, category: g.category, link: g.link, caption: g.caption, at: g.at,
+      key: g.key, style: g.style, title: g.title, category: g.category, link: g.link, caption: g.caption, at: g.at,
       fresh: now - g.at < FRESH_MS, seen: seen.has(g.key),
       cover: g.image?.media_url ?? null,
       // One slide per story: the reel when there is one, otherwise the picture.

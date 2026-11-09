@@ -7,7 +7,7 @@ const post = (kind: "image" | "video", key: string): StudioPost => ({ id: 1, edi
 const group = (key: string, ageMs: number, kinds: ("image" | "video")[] = ["image", "video"]): StudioGroup => {
   const posts = kinds.map((k) => post(k, key));
   const image = posts.find((p) => p.kind === "image"), video = posts.find((p) => p.kind === "video");
-  return { key, at: NOW - ageMs, title: key, category: "News", caption: "", link: "/brief?e=KE", status: "published", posts, ...(image ? { image } : {}), ...(video ? { video } : {}) };
+  return { key, at: NOW - ageMs, style: "headline", title: key, category: "News", caption: "", link: "/brief?e=KE", status: "published", posts, ...(image ? { image } : {}), ...(video ? { video } : {}) };
 };
 
 describe("status row", () => {
